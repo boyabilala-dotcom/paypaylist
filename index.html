@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
@@ -20,10 +20,14 @@
         .font-serif {
             font-family: 'Noto Serif TC', serif;
         }
-        /* 避免圖標渲染問題的微調 */
         svg {
             display: inline-block;
             vertical-align: middle;
+        }
+        /* 隱藏原生日期選擇器的部分樣式以符合設計 */
+        input[type="month"]::-webkit-calendar-picker-indicator {
+            filter: invert(40%) sepia(10%) saturate(800%) hue-rotate(60deg) brightness(95%) contrast(85%);
+            cursor: pointer;
         }
     </style>
 </head>
@@ -31,15 +35,13 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
+        const { useState, useEffect, useRef, useMemo } = React;
 
-        // 由於 Lucide 在 CDN 下的行為，我們手動建立一個簡單的圖標組件封裝
         const Icon = ({ name, size = 24, className = "" }) => {
             const iconRef = useRef(null);
             
             useEffect(() => {
                 if (iconRef.current) {
-                    // 使用 lucide.createIcons 來渲染特定的圖標
                     lucide.createIcons({
                         attrs: {
                             strokeWidth: 2,
@@ -60,16 +62,23 @@
             "第一銀行", "華南銀行", "兆豐銀行", "永豐銀行", "渣打銀行", "中華郵政", "連線銀行 (LINE Bank)"
         ];
 
+        const STORAGE_KEY = 'SAGE_LIFE_LEDGER_DATA';
+
         function App() {
             const [activeTab, setActiveTab] = useState('record');
             const [isRecordModalOpen, setIsRecordModalOpen] = useState(false);
             const [isWishModalOpen, setIsWishModalOpen] = useState(false);
             const [isAssetEditModalOpen, setIsAssetEditModalOpen] = useState(false);
-            const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
             const [editingItem, setEditingItem] = useState(null);
             const [assetEditType, setAssetEditType] = useState(null); 
             const [selectedAccountType, setSelectedAccountType] = useState('cash');
             const [notification, setNotification] = useState(null);
+            
+            // 新增：目前查詢的月份狀態 (格式: YYYY-MM)
+            const today = new Date();
+            const initialMonth = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+            const [viewMonth, setViewMonth] = useState(initialMonth);
+
             const fileInputRef = useRef(null);
 
             const [settings, setSettings] = useState({
@@ -80,20 +89,60 @@
                 banks: [{ id: 'b1', name: '預設銀行', balance: 0 }],
                 cards: []
             });
-
             const [records, setRecords] = useState([]);
             const [wishes, setWishes] = useState([]);
+            const [isLoaded, setIsLoaded] = useState(false);
+
+            useEffect(() => {
+                const savedData = localStorage.getItem(STORAGE_KEY);
+                if (savedData) {
+                    try {
+                        const parsed = JSON.parse(savedData);
+                        if (parsed.settings) setSettings(parsed.settings);
+                        if (parsed.records) setRecords(parsed.records);
+                        if (parsed.wishes) setWishes(parsed.wishes);
+                    } catch (e) {
+                        console.error("無法解析儲存的資料", e);
+                    }
+                }
+                setIsLoaded(true);
+            }, []);
+
+            useEffect(() => {
+                if (isLoaded) {
+                    const dataToSave = JSON.stringify({ settings, records, wishes });
+                    localStorage.setItem(STORAGE_KEY, dataToSave);
+                }
+            }, [settings, records, wishes, isLoaded]);
+
+            // 計算當前選擇月份的過濾紀錄與統計
+            const filteredRecords = useMemo(() => {
+                return records.filter(r => r.date.startsWith(viewMonth));
+            }, [records, viewMonth]);
+
+            const monthStats = useMemo(() => {
+                return filteredRecords.reduce((acc, r) => {
+                    if (r.type === 'income') acc.income += r.amount;
+                    else acc.expense += r.amount;
+                    return acc;
+                }, { income: 0, expense: 0 });
+            }, [filteredRecords]);
 
             const totalCashBank = settings.cash + settings.banks.reduce((acc, b) => acc + (Number(b.balance) || 0), 0);
             const totalCardDebt = settings.cards.reduce((acc, c) => acc + (Number(c.currentDebt) || 0), 0);
 
-            const today = new Date();
-            const currentMonthStr = `${today.getFullYear()}-${today.getMonth() + 1}`;
-            const isSalaryDue = today.getDate() >= settings.salaryDay && settings.lastSalaryMonth !== currentMonthStr;
+            const currentMonthStrForSalary = `${today.getFullYear()}-${today.getMonth() + 1}`;
+            const isSalaryDue = today.getDate() >= settings.salaryDay && settings.lastSalaryMonth !== currentMonthStrForSalary;
 
             const showNotice = (msg) => {
                 setNotification(msg);
                 setTimeout(() => setNotification(null), 3000);
+            };
+
+            const changeMonth = (offset) => {
+                const [y, m] = viewMonth.split('-').map(Number);
+                const date = new Date(y, m - 1 + offset, 1);
+                setViewMonth(`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`);
             };
 
             const exportToCSV = () => {
@@ -177,6 +226,18 @@
                 const type = formData.get('type');
                 const isIncome = type === 'income';
 
+                if (editingItem) {
+                    setSettings(prev => {
+                        let restoredSettings = { ...prev };
+                        const wasIncome = editingItem.type === 'income';
+                        const oldAmt = editingItem.amount;
+                        if (editingItem.accountType === 'cash') restoredSettings.cash = wasIncome ? prev.cash - oldAmt : prev.cash + oldAmt;
+                        else if (editingItem.accountType === 'bank') restoredSettings.banks = prev.banks.map(b => b.id === editingItem.accountId ? { ...b, balance: wasIncome ? b.balance - oldAmt : b.balance + oldAmt } : b);
+                        else if (editingItem.accountType === 'credit') restoredSettings.cards = prev.cards.map(c => c.id === editingItem.accountId ? { ...c, currentDebt: wasIncome ? c.currentDebt + oldAmt : c.currentDebt - oldAmt } : c);
+                        return restoredSettings;
+                    });
+                }
+
                 setSettings(prev => {
                     let nextSettings = { ...prev };
                     if (accType === 'cash') nextSettings.cash = isIncome ? prev.cash + amount : prev.cash - amount;
@@ -193,14 +254,14 @@
                     type: type,
                     accountType: accType,
                     accountId: accId || null,
-                    installments: Number(formData.get('installments') || 1),
+                    installments: 1,
                     note: formData.get('note')
                 };
 
                 if (editingItem) setRecords(records.map(r => r.id === editingItem.id ? data : r));
                 else setRecords([data, ...records]);
                 
-                if (isIncome && data.category.includes('薪資')) setSettings(prev => ({ ...prev, lastSalaryMonth: currentMonthStr }));
+                if (isIncome && data.category.includes('薪資')) setSettings(prev => ({ ...prev, lastSalaryMonth: currentMonthStrForSalary }));
                 setIsRecordModalOpen(false);
                 setEditingItem(null);
                 showNotice("紀錄已保存");
@@ -222,6 +283,34 @@
                 setIsAssetEditModalOpen(false);
                 showNotice("資產設定已更新");
             };
+
+            const saveWish = (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                const newWish = {
+                    id: Date.now(),
+                    name: formData.get('name'),
+                    price: Number(formData.get('price')),
+                    targetDate: formData.get('targetDate'),
+                    isAchieved: false
+                };
+                setWishes([newWish, ...wishes]);
+                setIsWishModalOpen(false);
+                showNotice("願望已許下");
+            };
+
+            const numberInputProps = {
+                type: "number",
+                inputMode: "decimal",
+                pattern: "[0-9]*",
+                onKeyPress: (e) => {
+                    if (!/[0-9]/.test(e.key)) {
+                        e.preventDefault();
+                    }
+                }
+            };
+
+            if (!isLoaded) return <div className="min-h-screen bg-[#F4F6F2] flex items-center justify-center text-[#8BA888] font-bold">載入中...</div>;
 
             return (
                 <div className="min-h-screen bg-[#F4F6F2] text-[#424B3E] pb-28 font-sans selection:bg-[#8BA888]/20">
@@ -252,6 +341,7 @@
                     <main className="px-6 space-y-8">
                         {activeTab === 'record' && (
                             <div className="space-y-6">
+                                {/* 頂部資產卡片 */}
                                 <div className="bg-[#DDE5DB] p-8 rounded-[2.5rem] shadow-sm border border-[#C5D1C3] space-y-6">
                                     <div className="grid grid-cols-2 gap-6">
                                         <div className="space-y-1 border-r border-[#B8C7B5] pr-4">
@@ -279,6 +369,41 @@
                                     </div>
                                 </div>
 
+                                {/* 月份切換器 */}
+                                <div className="flex items-center justify-between bg-white px-6 py-4 rounded-[2rem] border border-[#E3E8DF]">
+                                    <button onClick={() => changeMonth(-1)} className="p-2 text-[#8BA888] hover:bg-[#F4F6F2] rounded-full">
+                                        <Icon name="chevron-left" size={20} />
+                                    </button>
+                                    <div className="flex flex-col items-center">
+                                        <div className="relative">
+                                            <span className="text-sm font-black text-[#2F362E] tracking-widest">{viewMonth.replace('-', ' / ')}</span>
+                                            <input 
+                                                type="month" 
+                                                value={viewMonth} 
+                                                onChange={(e) => setViewMonth(e.target.value)}
+                                                className="absolute inset-0 opacity-0 cursor-pointer"
+                                            />
+                                        </div>
+                                        <p className="text-[9px] font-bold text-[#A4AE9F] uppercase">點擊切換月份</p>
+                                    </div>
+                                    <button onClick={() => changeMonth(1)} className="p-2 text-[#8BA888] hover:bg-[#F4F6F2] rounded-full">
+                                        <Icon name="chevron-right" size={20} />
+                                    </button>
+                                </div>
+
+                                {/* 本月統計小計 */}
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div className="bg-white p-5 rounded-[2rem] border border-[#E3E8DF]">
+                                        <p className="text-[9px] font-black text-[#6B8E67] uppercase tracking-wider mb-1">本月收入</p>
+                                        <p className="text-lg font-black text-[#2F362E]">${monthStats.income.toLocaleString()}</p>
+                                    </div>
+                                    <div className="bg-white p-5 rounded-[2rem] border border-[#E3E8DF]">
+                                        <p className="text-[9px] font-black text-[#8B5E4F] uppercase tracking-wider mb-1">本月支出</p>
+                                        <p className="text-lg font-black text-[#2F362E]">${monthStats.expense.toLocaleString()}</p>
+                                    </div>
+                                </div>
+
+                                {/* 收支明細列表 */}
                                 <div className="space-y-3">
                                     <div className="flex justify-between items-center px-1">
                                         <h3 className="text-xs font-black text-[#6B7C68] uppercase tracking-widest">收支明細</h3>
@@ -288,7 +413,7 @@
                                             <input type="file" ref={fileInputRef} onChange={handleImportCSV} accept=".csv" className="hidden" />
                                         </div>
                                     </div>
-                                    {records.length > 0 ? records.map(record => (
+                                    {filteredRecords.length > 0 ? filteredRecords.map(record => (
                                         <div key={record.id} onClick={() => { setEditingItem(record); setSelectedAccountType(record.accountType); setIsRecordModalOpen(true); }} className="bg-white p-5 rounded-[2rem] border border-[#E3E8DF] flex justify-between items-center cursor-pointer hover:border-[#8BA888] transition-all">
                                             <div className="flex items-center gap-4">
                                                 <div className={`w-10 h-10 rounded-2xl flex items-center justify-center ${record.type === 'expense' ? 'bg-[#F2F4F1]' : 'bg-[#EDF2EC] text-[#6B8E67]'}`}>
@@ -296,14 +421,22 @@
                                                 </div>
                                                 <div>
                                                     <h4 className="font-bold text-sm text-[#2F362E]">{record.category}</h4>
-                                                    <p className="text-[9px] font-bold text-[#A4AE9F]">{record.date}</p>
+                                                    <div className="flex flex-col">
+                                                        <p className="text-[9px] font-bold text-[#A4AE9F]">{record.date}</p>
+                                                        {record.note && <p className="text-[10px] text-[#8BA888] mt-0.5 truncate max-w-[120px]">{record.note}</p>}
+                                                    </div>
                                                 </div>
                                             </div>
                                             <p className={`font-black text-base ${record.type === 'expense' ? 'text-[#424B3E]' : 'text-[#6B8E67]'}`}>
                                                 {record.type === 'expense' ? '-' : '+'}${record.amount.toLocaleString()}
                                             </p>
                                         </div>
-                                    )) : <p className="text-center py-10 text-xs text-gray-400">目前沒有紀錄，點擊右下角開始記帳吧！</p>}
+                                    )) : (
+                                        <div className="text-center py-16 bg-white rounded-[2rem] border border-dashed border-[#CCD4C9]">
+                                            <Icon name="coffee" size={32} className="text-[#CCD4C9] mb-3" />
+                                            <p className="text-xs text-[#A4AE9F] font-bold tracking-widest">{viewMonth} 沒有紀錄</p>
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         )}
@@ -382,16 +515,51 @@
 
                     {isRecordModalOpen && (
                         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[70] flex items-end sm:items-center justify-center">
-                            <form onSubmit={saveRecord} className="bg-white w-full max-w-lg rounded-t-[3rem] sm:rounded-[3rem] p-10 space-y-6">
-                                <div className="flex justify-between items-center"><h2 className="text-xl font-black">記帳</h2><button type="button" onClick={() => setIsRecordModalOpen(false)}><Icon name="x" size={28} /></button></div>
-                                <input name="amount" type="number" defaultValue={editingItem?.amount} placeholder="金額" className="w-full text-center text-5xl font-black outline-none border-b py-4" required />
+                            <form onSubmit={saveRecord} className="bg-white w-full max-w-lg rounded-t-[3rem] sm:rounded-[3rem] p-10 space-y-6 overflow-y-auto max-h-[90vh]">
+                                <div className="flex justify-between items-center"><h2 className="text-xl font-black">{editingItem ? '編輯紀錄' : '記帳'}</h2><button type="button" onClick={() => setIsRecordModalOpen(false)}><Icon name="x" size={28} /></button></div>
+                                <input 
+                                    name="amount" 
+                                    defaultValue={editingItem?.amount} 
+                                    placeholder="0" 
+                                    className="w-full text-center text-5xl font-black outline-none border-b py-4" 
+                                    required 
+                                    {...numberInputProps}
+                                />
                                 <div className="grid grid-cols-2 gap-4">
                                     <select name="type" defaultValue={editingItem?.type || "expense"} className="bg-gray-50 p-4 rounded-2xl font-bold"><option value="expense">支出</option><option value="income">收入</option></select>
                                     <select name="accountType" value={selectedAccountType} onChange={(e) => setSelectedAccountType(e.target.value)} className="bg-gray-50 p-4 rounded-2xl font-bold"><option value="cash">現金</option><option value="bank">銀行</option><option value="credit">信用卡</option></select>
                                 </div>
-                                <input name="category" defaultValue={editingItem?.category} placeholder="分類 (如: 飲食)" className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required />
-                                <input name="date" type="date" defaultValue={editingItem?.date || today.toISOString().split('T')[0]} className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required />
-                                <button type="submit" className="w-full bg-[#8BA888] text-white font-black py-5 rounded-2xl shadow-xl">保存</button>
+                                {selectedAccountType !== 'cash' && (
+                                    <select name="accountId" defaultValue={editingItem?.accountId} className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required>
+                                        <option value="">選擇帳戶</option>
+                                        {selectedAccountType === 'bank' && settings.banks.map(b => <option key={b.id} value={b.id}>{b.name} (${b.balance})</option>)}
+                                        {selectedAccountType === 'credit' && settings.cards.map(c => <option key={c.id} value={c.id}>{c.name} (欠款 ${c.currentDebt})</option>)}
+                                    </select>
+                                )}
+                                <div className="space-y-4">
+                                    <input name="category" defaultValue={editingItem?.category} placeholder="分類 (如: 飲食)" className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required />
+                                    <input name="date" type="date" defaultValue={editingItem?.date || today.toISOString().split('T')[0]} className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required />
+                                    <textarea name="note" defaultValue={editingItem?.note} placeholder="寫點備註吧... (例如: 午餐吃火鍋)" className="w-full bg-gray-50 p-4 rounded-2xl font-bold min-h-[100px] resize-none"></textarea>
+                                </div>
+                                <button type="submit" className="w-full bg-[#8BA888] text-white font-black py-5 rounded-2xl shadow-xl hover:bg-[#6B8E67] transition-colors">保存紀錄</button>
+                            </form>
+                        </div>
+                    )}
+
+                    {isWishModalOpen && (
+                        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[70] flex items-center justify-center p-6">
+                            <form onSubmit={saveWish} className="bg-white w-full max-sm rounded-[3rem] p-10 space-y-6">
+                                <div className="flex justify-between items-center"><h2 className="text-xl font-black">許願</h2><button type="button" onClick={() => setIsWishModalOpen(false)}><Icon name="x" size={24} /></button></div>
+                                <input name="name" placeholder="想實現什麼呢？" className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required />
+                                <input 
+                                    name="price" 
+                                    placeholder="所需金額" 
+                                    className="w-full bg-gray-50 p-4 rounded-2xl font-bold" 
+                                    required 
+                                    {...numberInputProps}
+                                />
+                                <input name="targetDate" type="date" className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required />
+                                <button type="submit" className="w-full bg-[#8BA888] text-white font-black py-4 rounded-2xl shadow-lg">送出願望</button>
                             </form>
                         </div>
                     )}
@@ -400,12 +568,45 @@
                         <div className="fixed inset-0 bg-black/60 z-[80] flex items-center justify-center p-6">
                             <form onSubmit={handleAssetSave} className="bg-white w-full max-w-sm rounded-[3rem] p-10 space-y-6">
                                 <h2 className="text-xl font-black">設定資產</h2>
-                                {assetEditType === 'cash' && <input name="amount" type="number" defaultValue={settings.cash} className="w-full bg-gray-50 p-4 rounded-2xl font-bold" />}
+                                {assetEditType === 'cash' && (
+                                    <input 
+                                        name="amount" 
+                                        defaultValue={settings.cash} 
+                                        className="w-full bg-gray-50 p-4 rounded-2xl font-bold" 
+                                        {...numberInputProps}
+                                    />
+                                )}
                                 {assetEditType === 'bank' && (
                                     <>
                                         <select name="name" defaultValue={editingItem?.name} className="w-full bg-gray-50 p-4 rounded-2xl font-bold">{TAIWAN_BANKS.map(b => <option key={b} value={b}>{b}</option>)}</select>
-                                        <input name="balance" type="number" defaultValue={editingItem?.balance || 0} className="w-full bg-gray-50 p-4 rounded-2xl font-bold" />
+                                        <input 
+                                            name="balance" 
+                                            defaultValue={editingItem?.balance || 0} 
+                                            className="w-full bg-gray-50 p-4 rounded-2xl font-bold" 
+                                            {...numberInputProps}
+                                        />
                                     </>
+                                )}
+                                {assetEditType === 'card' && (
+                                    <>
+                                        <input name="name" placeholder="卡片名稱" defaultValue={editingItem?.name} className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required />
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <input name="billDay" type="number" placeholder="結帳日 (1-31)" defaultValue={editingItem?.billDay || 10} className="bg-gray-50 p-4 rounded-2xl font-bold" required />
+                                            <select name="linkedBankId" defaultValue={editingItem?.linkedBankId} className="bg-gray-50 p-4 rounded-2xl font-bold" required>
+                                                <option value="">扣款銀行</option>
+                                                {settings.banks.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                                            </select>
+                                        </div>
+                                    </>
+                                )}
+                                {assetEditType === 'salary' && (
+                                    <div className="space-y-4">
+                                        <input name="salaryDay" type="number" placeholder="領薪日" defaultValue={settings.salaryDay} className="w-full bg-gray-50 p-4 rounded-2xl font-bold" required />
+                                        <select name="salaryAccount" defaultValue={settings.salaryAccount} className="w-full bg-gray-50 p-4 rounded-2xl font-bold">
+                                            <option value="cash">現金</option>
+                                            {settings.banks.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                                        </select>
+                                    </div>
                                 )}
                                 <button type="submit" className="w-full bg-[#8BA888] text-white font-black py-4 rounded-2xl">更新</button>
                                 <button type="button" onClick={() => setIsAssetEditModalOpen(false)} className="w-full text-xs text-gray-400">取消</button>
@@ -420,4 +621,7 @@
         root.render(<App />);
     </script>
 </body>
+</html>
+</body>
+
 </html>
